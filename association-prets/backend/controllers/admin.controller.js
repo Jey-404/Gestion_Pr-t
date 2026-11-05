@@ -1,0 +1,29 @@
+import argon2 from 'argon2';
+import { randomUUID } from 'node:crypto';
+import {pool} from '../config/db.js';
+const ROLES=['membre','secretaire','comptable','directeur','administrateur'];
+const STATUTS=['actif','suspendu','inactif'];
+function identifiant(id){return /^[1-9]\d*$/.test(String(id))&&Number.isSafeInteger(Number(id))}
+function formatUser(x){return {id:String(x.id),numeroMembre:x.numero_membre,nom:x.nom,prenom:x.prenom,email:x.email,telephone:x.telephone,role:x.role,statut:x.statut,dateAdhesion:x.date_adhesion}}
+function erreurSQL(res,e){console.error('[ADMIN]',e.code||e.message);if(e.code==='ER_DUP_ENTRY')return res.status(409).json({success:false,message:'Valeur déjà utilisée (email ou numéro de membre).'});return res.status(500).json({success:false,message:'Erreur de base de données.'})}
+export async function tableauBordAdmin(req,res){try{
+ const [[stats]]=await pool.query(`SELECT COUNT(*) AS total,COALESCE(SUM(role='membre'),0) AS membres,COALESCE(SUM(statut='actif'),0) AS actifs FROM utilisateurs`);
+ const [[loans]]=await pool.query(`SELECT COUNT(*) AS total,COALESCE(SUM(statut='soumis'),0) AS soumis,COALESCE(SUM(statut='en_decision'),0) AS decisions,COALESCE(SUM(statut='approuve'),0) AS approuves,COALESCE(SUM(statut IN ('decaisse','en_remboursement','rembourse')),0) AS decaisses FROM prets`);
+ const [rows]=await pool.query(`SELECT p.id,p.montant,p.motif,p.statut,p.date_demande,u.nom,u.prenom FROM prets p JOIN utilisateurs u ON u.id=p.utilisateur_id ORDER BY p.date_demande DESC,p.id DESC LIMIT 5`);
+ return res.json({success:true,statistiques:{utilisateurs:Number(stats.total),membres:Number(stats.membres),actifs:Number(stats.actifs),prets:Number(loans.total),soumis:Number(loans.soumis),enDecision:Number(loans.decisions),approuves:Number(loans.approuves),decaisses:Number(loans.decaisses)},dernieresDemandes:rows.map(r=>({id:String(r.id),montant:Number(r.montant),motif:r.motif,statut:r.statut,dateDemande:r.date_demande,membre:{nom:r.nom,prenom:r.prenom}}))});
+ }catch(e){return erreurSQL(res,e)}}
+export async function listerUtilisateurs(req,res){try{const [rows]=await pool.query(`SELECT id,numero_membre,nom,prenom,email,telephone,role,statut,date_adhesion FROM utilisateurs ORDER BY id DESC LIMIT 2000`);res.json({success:true,utilisateurs:rows.map(formatUser)})}catch(e){erreurSQL(res,e)}}
+export async function creerUtilisateur(req,res){const {nom,prenom,email,telephone,role='membre',numeroMembre}=req.body||{};
+ if(!ROLES.includes(role)||typeof nom!=='string'||!nom.trim()||typeof prenom!=='string'||!prenom.trim()||typeof email!=='string'||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())||email.length>254||typeof telephone!=='string'||!/^[0-9]{10}$/.test(telephone))return res.status(400).json({success:false,message:'Nom, prénom, email, rôle ou téléphone invalide.'});
+ const hash=await argon2.hash('12345678',{type:argon2.argon2id});try{
+ // numéro optionnel, généré à partir de l'identifiant à la création lorsque nécessaire.
+ const numero = typeof numeroMembre === 'string' && numeroMembre.trim() ? numeroMembre.trim().slice(0,50) : `MEM-${randomUUID().slice(0,12).toUpperCase()}`;
+ const [r]=await pool.execute(`INSERT INTO utilisateurs (numero_membre,nom,prenom,email,telephone,role,statut,mot_de_passe_hash) VALUES (?,?,?,?,?,?,'actif',?)`,[numero,nom.trim().slice(0,120),prenom.trim().slice(0,120),email.trim().toLowerCase(),telephone,role,hash]);
+ res.status(201).json({success:true,message:'Compte créé. Mot de passe temporaire : 12345678. Le membre doit le changer après sa première connexion.',id:String(r.insertId)});
+ }catch(e){erreurSQL(res,e)}}
+export async function modifierUtilisateur(req,res){const id=req.params.id;if(!identifiant(id))return res.status(400).json({success:false,message:'Identifiant invalide.'});const {nom,prenom,email,telephone,role,statut}=req.body||{};
+ if(!ROLES.includes(role)||!STATUTS.includes(statut)||![nom,prenom,email,telephone].every(x=>typeof x==='string')||!nom.trim()||!prenom.trim()||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!/^\d{10}$/.test(telephone))return res.status(400).json({success:false,message:'Données invalides.'});
+ if(String(req.adminId)===String(id)&&(role!=='administrateur'||statut!=='actif'))return res.status(409).json({success:false,message:'Vous ne pouvez pas supprimer vos propres droits.'});
+ try{const [r]=await pool.execute(`UPDATE utilisateurs SET nom=?,prenom=?,email=?,telephone=?,role=?,statut=? WHERE id=?`,[nom.trim(),prenom.trim(),email.trim().toLowerCase(),telephone,role,statut,id]);if(!r.affectedRows)return res.status(404).json({success:false,message:'Utilisateur introuvable.'});res.json({success:true,message:'Compte modifié.'})}catch(e){erreurSQL(res,e)}}
+export async function resetMotDePasse(req,res){const id=req.params.id;if(!identifiant(id))return res.status(400).json({success:false,message:'Identifiant invalide.'});if(String(id)===String(req.adminId))return res.status(409).json({success:false,message:'Utilisez votre profil pour modifier votre mot de passe.'});try{const hash=await argon2.hash('12345678',{type:argon2.argon2id});const [r]=await pool.execute('UPDATE utilisateurs SET mot_de_passe_hash=? WHERE id=?',[hash,id]);if(!r.affectedRows)return res.status(404).json({success:false,message:'Utilisateur introuvable.'});res.json({success:true,message:'Mot de passe réinitialisé à 12345678. Communiquez-le de manière privée et demandez son changement immédiat.'})}catch(e){erreurSQL(res,e)}}
+export async function listerPretsAdmin(req,res){try{const [rows]=await pool.query(`SELECT p.id,p.montant,p.motif,p.statut,p.date_demande,u.nom,u.prenom,u.email FROM prets p JOIN utilisateurs u ON u.id=p.utilisateur_id ORDER BY p.id DESC LIMIT 500`);res.json({success:true,prets:rows.map(r=>({id:String(r.id),montant:Number(r.montant),motif:r.motif,statut:r.statut,dateDemande:r.date_demande,membre:{nom:r.nom,prenom:r.prenom,email:r.email}}))})}catch(e){erreurSQL(res,e)}}

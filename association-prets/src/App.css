@@ -1,0 +1,26 @@
+
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.main-content {
+  flex: 1;
+  min-width: 0;
+  padding: 30px;
+  background: #f8fafc;
+}
+
+.main-content h1 {
+  color: #172b42;
+}
+
+.main-content p {
+  color: #64748b;
+}
+
+@media (max-width: 768px) {
+  .app-layout {
+    flex-direction: column;
+  }
+}
